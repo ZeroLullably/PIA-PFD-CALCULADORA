@@ -450,6 +450,13 @@ with st.sidebar:
             "Dividend yield anual (%)",
             min_value=0.0, max_value=100.0, value=0.0, step=0.05
         )
+        moneyness_range = st.slider(
+            "Rango de strikes para mostrar (K / S₀)",
+            min_value=0.10, max_value=3.00,
+            value=(0.80, 1.20), step=0.05,
+            help="Limita tablas y gráficas a strikes cercanos al precio del activo. "
+                 "No elimina los contratos de los archivos originales."
+        )
         consult = st.form_submit_button(
             "Consultar activo", type="primary", use_container_width=True
         )
@@ -489,7 +496,8 @@ if consult:
                     "sigma": sigma, "spot": spot, "actual_ref": actual_ref,
                     "requested_ref": reference_date, "start_date": start_date,
                     "years": int(years), "rate": rate_pct / 100,
-                    "q": dividend_pct / 100
+                    "q": dividend_pct / 100,
+                    "moneyness_range": tuple(moneyness_range)
                 }
                 st.session_state["expirations"] = valid_expirations
                 for key in ["analysis", "folder", "zip"]:
@@ -560,19 +568,41 @@ if "asset" in st.session_state:
                     raise ValueError("Yahoo Finance no devolvió contratos analizables.")
 
                 st.write("Calculando griegas y generando gráficas...")
+                low_m, high_m = asset["moneyness_range"]
+                visible_results = results[
+                    results["Moneyness_K_S0"].between(low_m, high_m)
+                ].copy()
+                visible_options = options[
+                    (options["Strike"] / asset["spot"]).between(low_m, high_m)
+                ].copy()
+
                 greek_table = build_greeks(
-                    options, asset["spot"], T, r, asset["sigma"], asset["q"]
+                    visible_options, asset["spot"], T, r,
+                    asset["sigma"], asset["q"]
                 )
-                figures = make_figures(results, greek_table, asset["ticker"])
+                figures = make_figures(visible_results, greek_table, asset["ticker"])
 
                 st.write("Guardando tablas, históricos y gráficas...")
                 folder, zip_data = save_results(
                     asset["ticker"], str(asset["actual_ref"]), expiry,
                     asset["history"], options, results, greek_table, figures
                 )
+                # Guardar también el subconjunto cercano al precio spot.
+                visible_results.to_csv(folder / "resultados_rango_cercano.csv", index=False)
+                visible_options.to_csv(folder / "opciones_rango_cercano.csv", index=False)
+                buffer = io.BytesIO()
+                with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+                    for file in folder.iterdir():
+                        if file.is_file():
+                            zf.write(file, arcname=file.name)
+                buffer.seek(0)
+                zip_data = buffer.getvalue()
 
                 st.session_state["analysis"] = {
-                    "options": options, "results": results, "greeks": greek_table,
+                    "options": options, "results": results,
+                    "visible_options": visible_options,
+                    "visible_results": visible_results,
+                    "greeks": greek_table,
                     "figures": figures, "expiry": expiry, "T": T,
                     "days": days, "r": r
                 }
@@ -588,8 +618,10 @@ if "asset" in st.session_state:
 if "analysis" in st.session_state:
     asset = st.session_state["asset"]
     analysis = st.session_state["analysis"]
-    results = analysis["results"]
+    all_results = analysis["results"]
+    results = analysis["visible_results"]
     greek_table = analysis["greeks"]
+    low_m, high_m = asset["moneyness_range"]
 
     st.divider()
     st.header("Resultados del análisis")
@@ -600,12 +632,31 @@ if "analysis" in st.session_state:
 
     valid_calls = results["Call_Mercado"].notna().sum()
     valid_puts = results["Put_Mercado"].notna().sum()
+    paired_quotes = results["Paridad_C_menos_P"].notna().sum()
     st.info(
-        f"Cotizaciones válidas después de la revisión: "
-        f"{valid_calls} Calls y {valid_puts} Puts. "
-        "Las cotizaciones rechazadas se conservan identificadas en la tabla, "
-        "pero no se usan para volatilidad implícita ni paridad."
+        f"Rango mostrado: {low_m:.2f} ≤ K/S₀ ≤ {high_m:.2f}. "
+        f"En este rango hay {len(results)} strikes, {valid_calls} Calls válidas, "
+        f"{valid_puts} Puts válidas y {paired_quotes} pares Call-Put utilizables. "
+        "Las cotizaciones rechazadas no se usan para volatilidad implícita ni paridad."
     )
+    with st.expander("Consultar cadena completa descargada de Yahoo Finance"):
+        st.caption(
+            "Se conserva la cadena completa para consulta y exportación. "
+            "Los cálculos y gráficas principales se concentran en el rango seleccionado."
+        )
+        st.dataframe(
+            all_results[[
+                "Strike", "Call_Bid", "Call_Ask", "Call_Mercado", "Call_Estado",
+                "Put_Bid", "Put_Ask", "Put_Mercado", "Put_Estado"
+            ]].style.format(precision=4, na_rep="—"),
+            use_container_width=True, height=350, hide_index=True
+        )
+
+    if results.empty:
+        st.warning(
+            "No hay strikes dentro del rango seleccionado. "
+            "Amplía el rango K/S₀ desde el panel lateral y vuelve a consultar el activo."
+        )
 
     tabs = st.tabs([
         "Precios BSM", "Volatilidad implícita", "Griegas",
@@ -620,7 +671,7 @@ if "analysis" in st.session_state:
         ]
         st.dataframe(
             results[cols].style.format(precision=4, na_rep="—"),
-            use_container_width=True, hide_index=True
+            use_container_width=True, height=520, hide_index=True
         )
         st.download_button(
             "Descargar tabla CSV",
@@ -638,7 +689,7 @@ if "analysis" in st.session_state:
                 "Strike": "{:,.2f}", "Moneyness_K_S0": "{:.4f}",
                 "Call_IV": "{:.2%}", "Put_IV": "{:.2%}"
             }, na_rep="—"),
-            use_container_width=True, hide_index=True
+            use_container_width=True, height=520, hide_index=True
         )
         st.download_button(
             "Descargar tabla CSV",
@@ -653,7 +704,7 @@ if "analysis" in st.session_state:
                 "Vega_por_1pct": "{:.6f}", "Theta_diaria": "{:.6f}",
                 "Rho_por_1pct": "{:.6f}"
             }, na_rep="—"),
-            use_container_width=True, hide_index=True
+            use_container_width=True, height=520, hide_index=True
         )
         st.caption(
             "Vega y Rho se expresan por 1 punto porcentual. "
@@ -673,12 +724,17 @@ if "analysis" in st.session_state:
         ]
         st.dataframe(
             results[cols].style.format(precision=4, na_rep="—"),
-            use_container_width=True, hide_index=True
+            use_container_width=True, height=520, hide_index=True
         )
         st.caption(
             "La paridad observada solo se calcula cuando existen cotizaciones "
             "válidas tanto para Call como para Put del mismo strike y vencimiento."
         )
+        if paired_quotes == 0:
+            st.warning(
+                "No hay pares Call-Put con cotizaciones válidas en el rango actual. "
+                "No es posible evaluar empíricamente la paridad con esta cadena."
+            )
         st.download_button(
             "Descargar tabla CSV",
             results[cols].to_csv(index=False).encode("utf-8"),
