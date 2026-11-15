@@ -1,7 +1,7 @@
 import io
 import zipfile
 from pathlib import Path
-from datetime import date
+from datetime import date, datetime
 from math import log, exp, sqrt, erf, pi
 
 import numpy as np
@@ -281,19 +281,33 @@ def get_option_chain(ticker, expiration):
 
 # -------------------- VALIDACIÓN Y RESULTADOS --------------------
 
-def valid_midpoint(bid, ask, S, K, T, r, q, kind):
-    """Devuelve midpoint solo si bid/ask son positivos, ordenados y compatibles con BSM."""
-
-    if pd.isna(bid) or pd.isna(ask):
-        return np.nan, "Sin cotización"
+def valid_midpoint(bid, ask, S, K, T, r, q, kind, quotes_comparable=True):
+    """
+    Calcula el punto medio únicamente cuando Bid/Ask son utilizables
+    y corresponden temporalmente al precio del subyacente.
+    """
+    if pd.isna(bid) and pd.isna(ask):
+        return np.nan, "Sin cotización: Bid y Ask faltantes"
+    if pd.isna(bid):
+        return np.nan, "Sin cotización: Bid faltante"
+    if pd.isna(ask):
+        return np.nan, "Sin cotización: Ask faltante"
 
     bid, ask = float(bid), float(ask)
 
-    if bid <= 0 or ask <= 0:
-        return np.nan, "Bid/Ask cero o vacío"
-
+    if bid < 0 or ask < 0:
+        return np.nan, "Cotización negativa"
+    if bid == 0 and ask == 0:
+        return np.nan, "Bid y Ask en cero"
+    if bid == 0:
+        return np.nan, "Bid en cero: sin precio comprador"
+    if ask == 0:
+        return np.nan, "Ask en cero: sin precio vendedor"
     if ask < bid:
-        return np.nan, "Mercado cruzado (Ask < Bid)"
+        return np.nan, "Mercado cruzado: Ask menor que Bid"
+
+    if not quotes_comparable:
+        return np.nan, "No comparable temporalmente"
 
     midpoint = (bid + ask) / 2
     lower, upper = option_price_bounds(S, K, T, r, q, kind)
@@ -301,25 +315,26 @@ def valid_midpoint(bid, ask, S, K, T, r, q, kind):
 
     if midpoint < lower - tolerance:
         return np.nan, "Precio inferior al límite teórico"
-
     if midpoint > upper + tolerance:
         return np.nan, "Precio superior al límite teórico"
 
     return midpoint, "Válida"
 
 
-def build_results(options, S, T, r, sigma, q):
+def build_results(options, S, T, r, sigma, q, quotes_comparable=True):
     rows = []
 
     for _, row in options.iterrows():
         K = float(row["Strike"])
 
         cm, call_status = valid_midpoint(
-            row["Call_Bid"], row["Call_Ask"], S, K, T, r, q, "call"
+            row["Call_Bid"], row["Call_Ask"], S, K, T, r, q, "call",
+            quotes_comparable=quotes_comparable
         )
 
         pm, put_status = valid_midpoint(
-            row["Put_Bid"], row["Put_Ask"], S, K, T, r, q, "put"
+            row["Put_Bid"], row["Put_Ask"], S, K, T, r, q, "put",
+            quotes_comparable=quotes_comparable
         )
 
         call_theory = bsm(S, K, T, r, sigma, "call", q)
@@ -369,7 +384,8 @@ def build_results(options, S, T, r, sigma, q):
             "Diferencia_Paridad": (
                 parity_market - parity_theory
                 if pd.notna(parity_market) else np.nan
-            )
+            ),
+            "Comparacion_temporal_permitida": bool(quotes_comparable)
         })
 
     return pd.DataFrame(rows)
@@ -763,13 +779,20 @@ if "asset" in st.session_state:
 
                 st.write("Validando cotizaciones y calculando precios BSM...")
 
+                # Yahoo Finance entrega la cadena disponible al momento de la
+                # consulta; no proporciona aquí un histórico de Bid/Ask.
+                # Solo se comparan precios/IV/paridad si el spot corresponde
+                # a la fecha actual de descarga.
+                quotes_comparable = (asset["actual_ref"] == date.today())
+
                 results = build_results(
                     options,
                     asset["spot"],
                     T,
                     r,
                     asset["sigma"],
-                    asset["q"]
+                    asset["q"],
+                    quotes_comparable=quotes_comparable
                 )
 
                 if results.empty:
@@ -850,7 +873,9 @@ if "asset" in st.session_state:
                     "expiry": expiry,
                     "T": T,
                     "days": days,
-                    "r": r
+                    "r": r,
+                    "quotes_comparable": quotes_comparable,
+                    "options_downloaded_at": datetime.now().astimezone().isoformat(timespec="seconds")
                 }
 
                 st.session_state["folder"] = str(folder)
@@ -888,11 +913,26 @@ if "analysis" in st.session_state:
     valid_puts = results["Put_Mercado"].notna().sum()
     paired_quotes = results["Paridad_C_menos_P"].notna().sum()
 
-    st.info(
-        f"Rango mostrado: {low_m:.2f} ≤ K/S₀ ≤ {high_m:.2f}. "
-        f"En este rango hay {len(results)} strikes, {valid_calls} Calls válidas, "
-        f"{valid_puts} Puts válidas y {paired_quotes} pares Call-Put utilizables. "
-        "Las cotizaciones rechazadas no se usan para volatilidad implícita ni paridad."
+    if analysis["quotes_comparable"]:
+        st.info(
+            f"Rango mostrado: {low_m:.2f} ≤ K/S₀ ≤ {high_m:.2f}. "
+            f"En este rango hay {len(results)} strikes, {valid_calls} Calls válidas, "
+            f"{valid_puts} Puts válidas y {paired_quotes} pares Call-Put utilizables. "
+            "Las cotizaciones rechazadas no se usan para volatilidad implícita ni paridad."
+        )
+    else:
+        st.warning(
+            f"Rango mostrado: {low_m:.2f} ≤ K/S₀ ≤ {high_m:.2f}. "
+            "La cadena Bid/Ask descargada no corresponde necesariamente a la fecha "
+            "histórica seleccionada. Por ello se conservan las cotizaciones originales "
+            "para consulta, pero no se calculan puntos medios de mercado, volatilidades "
+            "implícitas observadas ni paridad empírica. Las celdas sin resultado no son ceros."
+        )
+
+    st.caption(
+        f"Cadena de opciones descargada: {analysis['options_downloaded_at']}. "
+        "Yahoo Finance no proporciona en esta consulta la fecha/hora histórica individual "
+        "de cada cotización Bid/Ask."
     )
 
     with st.expander("Consultar cadena completa descargada de Yahoo Finance"):
@@ -974,8 +1014,10 @@ if "analysis" in st.session_state:
             "Strike",
             "Moneyness_K_S0",
             "Call_IV",
+            "Call_Estado",
             "Call_Metodo_IV",
             "Put_IV",
+            "Put_Estado",
             "Put_Metodo_IV"
         ]
 
@@ -1047,10 +1089,16 @@ if "analysis" in st.session_state:
 
         st.caption(
             "La paridad observada solo se calcula cuando existen cotizaciones "
-            "válidas tanto para Call como para Put del mismo strike y vencimiento."
+            "válidas tanto para Call como para Put del mismo strike y vencimiento, "
+            "y cuando la cadena es temporalmente comparable con el precio del subyacente."
         )
 
-        if paired_quotes == 0:
+        if not analysis["quotes_comparable"]:
+            st.warning(
+                "No se evalúa la paridad observada porque la cadena descargada no "
+                "corresponde necesariamente a la fecha histórica del subyacente."
+            )
+        elif paired_quotes == 0:
             st.warning(
                 "No hay pares Call-Put con cotizaciones válidas en el rango actual. "
                 "No es posible evaluar empíricamente la paridad con esta cadena."
