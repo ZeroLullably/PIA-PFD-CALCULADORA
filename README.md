@@ -5,3 +5,5 @@ Creado por:
 - 2008024 - Karen Yazmín Córdova Flores 
 - 2063900 - Cesar Daniel Ruiz Cisneros  
 - 1841767 - Yair Alfredo Pérez López 
+- 2062954 - Jesús Ángel Guzmán Palomares
+- 2024690 - Julio César Martínez Tamez
